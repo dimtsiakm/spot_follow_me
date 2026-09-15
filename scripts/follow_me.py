@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Follow-me demo: Spot tracks a person across its 5 body cameras and walks
-to keep FOLLOW_DISTANCE between them. If nobody is in view, it stands still
-with its body pitched up ("looking up"), searching, until someone appears.
+to keep FOLLOW_DISTANCE between them. If nobody is in view, it stands still,
+searching, until someone appears.
 
 A small Tkinter window shows how many distinct people are currently visible
 and who is locked, with Left/Right buttons to switch the lock to the next
-person to that side.
+person to that side. Sit and Stand set the posture; Pitch toggles the
+"looking up" body pose (on at startup). Both Stand and Pitch are disabled
+while Follow-Me is on - Follow-Me never looks up, and it clears the Pitch
+toggle when it starts, so stopping a follow leaves the robot level rather
+than pitching back up on its own.
 
 Distance/heading to a person come from the depth cameras (no arm, no
 external tracker hardware) - each *_depth_in_visual_frame image is
@@ -25,7 +29,7 @@ import os
 import time
 import tkinter as tk
 from datetime import datetime
-from math import atan2, degrees, hypot
+from math import atan2, cos, degrees, hypot
 
 import cv2
 import numpy as np
@@ -70,6 +74,24 @@ MAX_ANGULAR_VEL = 1.0        # rad/s
 KP_LINEAR = 0.6
 KP_ANGULAR = 1.2
 
+ANGULAR_DEADBAND = 0.08      # rad (~4.5 deg), no turn correction once the
+                              # (smoothed) bearing is this close to zero -
+                              # stops it hunting for an exact zero when
+                              # someone is roughly dead ahead
+BEARING_SMOOTHING_ALPHA = 0.35   # EMA weight on the newest bearing sample
+                                  # (0-1; lower = smoother/laggier, higher =
+                                  # snappier/noisier); reset to the raw value
+                                  # the moment a lock is (re)acquired so a new
+                                  # target isn't dragged in through stale
+                                  # smoothing
+MAX_ANGULAR_ACCEL = 2.5      # rad/s^2, caps how fast the *commanded* vrot
+                              # itself can swing between loop iterations, so
+                              # a P-controller correction ramps instead of
+                              # snapping straight to the target value and
+                              # overshooting - this, not the deadband, is
+                              # what kills the "overshoot and swing back"
+                              # left/right flicker when directly in front
+
 MIN_CMD_DURATION = 0.5       # s, floor/first-guess for how long a velocity command stays valid
 MAX_CMD_DURATION = 2.0       # s, ceiling - caps how long a stalled loop can keep it moving
 TARGET_LOST_FRAMES = 8       # loop iterations a locked target may vanish for
@@ -92,10 +114,39 @@ DEPTH_PATCH = 5               # side length (px) of the median-depth sample wind
 # whose body-frame positions are closer than this are treated as one physical
 # person, so the people count doesn't double up in camera overlap zones.
 DEDUP_RADIUS = 0.6           # m
-# A locked person is followed frame-to-frame by nearest body-frame position,
-# not by (camera, track_id) - that lets the lock survive a handoff between
-# cameras. A jump larger than this is treated as "lost", not "moved".
+# A locked person is followed frame-to-frame by nearest *vision*-frame
+# position, not by (camera, track_id) - that lets the lock survive a handoff
+# between cameras. A jump larger than this is treated as "lost", not "moved".
+# The frame matters: measured in the body frame, this threshold also counts
+# the robot's own yaw as target motion (a person 3 m out "jumps" ~0.3 m per
+# loop while the robot turns at 1 rad/s toward them), so a hard turn could
+# shake off the very lock it was turning toward.
 MAX_LOCK_JUMP = 1.0          # m
+
+# The 'left'/'right' side fisheye cameras only catch a person standing in
+# front at the extreme edge of their frame - a large angle off their optical
+# axis, where person_in_frames()'s pinhole back-projection is a poor
+# approximation of the lens's true fisheye distortion. Logged data
+# (logs/log_2026-09-15.jsonl) shows this placing the *same*, roughly
+# stationary person 2.5-5.8 m away from where frontleft/frontright correctly
+# place them, on either side, essentially at random - MAX_INCIDENCE_DEG below
+# is the primary fix, discarding any detection that far off-axis before it
+# can even become a lock candidate.
+MAX_INCIDENCE_DEG = 55       # deg off a camera's optical axis; beyond this the
+                              # pinhole model is untrustworthy for these lenses
+
+# Defense in depth for whatever MAX_INCIDENCE_DEG doesn't catch: that same bad
+# reading is harmless while a lock is live (MAX_LOCK_JUMP above rejects it as
+# a "jump"), but a *fresh* re-acquisition after a lock times out had no such
+# check at all, so the robot could still spin onto a phantom position. For a
+# short window after losing a lock, keep requiring a fresh pick to be near
+# where the person was actually last seen, grown by how far they could
+# plausibly have walked since.
+REACQUIRE_GRACE_SEC = 2.0    # s, how long after losing a lock a fresh pick
+                              # still has to be near where the person was
+                              # last actually seen
+MAX_WALK_SPEED = 1.0         # m/s, brisk-walk bound used to grow the
+                              # reacquisition search radius with elapsed time
 
 
 def clamp(value, lo, hi):
@@ -179,10 +230,21 @@ def sample_depth_m(depth_raw, depth_scale, cx, cy, patch=DEPTH_PATCH):
     return float(np.median(valid)) / depth_scale
 
 
-def person_in_body_frame(image_response, cx, cy, depth_m):
-    """Back-project a color-image pixel + depth reading to a 3D point in
-    BODY_FRAME_NAME, using this source's own pinhole intrinsics and this
-    shot's own calibration snapshot."""
+def person_in_frames(image_response, cx, cy, depth_m):
+    """Back-project a color-image pixel + depth reading to a 3D point, using
+    this source's own pinhole intrinsics and this shot's own calibration
+    snapshot. Returns (body_point, vision_point), or None for a transform
+    miss or for a pixel far enough off the lens's optical axis that this
+    linear pinhole model no longer approximates the real fisheye distortion
+    (see MAX_INCIDENCE_DEG) - that case reliably produced wildly wrong 3D
+    points from the 'left'/'right' side cameras when a person stood near
+    their frame edge, several meters from their true position.
+
+    The body-frame point is what the controller steers on *this* frame. The
+    vision-frame copy is what any position remembered across frames has to
+    be held in: the body frame turns with the robot, so a body-frame
+    position measured one frame ago describes a different place in the world
+    the moment the robot yaws - see the lock handling in step()."""
     intrinsics = image_response.source.pinhole.intrinsics
     fx, fy = intrinsics.focal_length.x, intrinsics.focal_length.y
     px, py = intrinsics.principal_point.x, intrinsics.principal_point.y
@@ -191,12 +253,19 @@ def person_in_body_frame(image_response, cx, cy, depth_m):
     y = (cy - py) * depth_m / fy
     z = depth_m
 
-    shot = image_response.shot
-    tform = get_a_tform_b(shot.transforms_snapshot, BODY_FRAME_NAME,
-                          shot.frame_name_image_sensor)
-    if tform is None:
+    incidence_deg = degrees(atan2(hypot(x, y), z))
+    if incidence_deg > MAX_INCIDENCE_DEG:
         return None
-    return tform.transform_point(x, y, z)
+
+    shot = image_response.shot
+    body_tform_cam = get_a_tform_b(shot.transforms_snapshot, BODY_FRAME_NAME,
+                                   shot.frame_name_image_sensor)
+    vision_tform_cam = get_a_tform_b(shot.transforms_snapshot, VISION_FRAME_NAME,
+                                     shot.frame_name_image_sensor)
+    if body_tform_cam is None or vision_tform_cam is None:
+        return None
+    return (body_tform_cam.transform_point(x, y, z),
+            vision_tform_cam.transform_point(x, y, z))
 
 
 def load_model():
@@ -243,11 +312,12 @@ def dedupe_people(raw_detections):
     people = []
     for cluster in clusters:
         best = max(cluster, key=lambda m: m['conf'])
-        avg_x = sum(m['x'] for m in cluster) / len(cluster)
-        avg_y = sum(m['y'] for m in cluster) / len(cluster)
+        avg = lambda k: sum(m[k] for m in cluster) / len(cluster)
+        avg_x, avg_y = avg('x'), avg('y')
         people.append({
             'camera': best['camera'], 'track_id': best['track_id'],
             'x': avg_x, 'y': avg_y,
+            'vision': (avg('vx'), avg('vy'), avg('vz')),
             'distance': hypot(avg_x, avg_y), 'bearing': atan2(avg_y, avg_x),
             'members': cluster,
         })
@@ -278,8 +348,11 @@ def send_velocity(command_client, vx, vy, vrot, duration):
     command_client.robot_command(cmd, end_time_secs=time.time() + duration)
 
 
-def send_idle_pose(command_client):
-    footprint_R_body = EulerZXY(yaw=0.0, roll=0.0, pitch=IDLE_LOOK_UP_PITCH)
+def send_stand_pose(command_client, pitch):
+    """Stand in place at a given body pitch. 0.0 is level; a negative value
+    tips the nose (and the front cameras with it) up - see
+    IDLE_LOOK_UP_PITCH."""
+    footprint_R_body = EulerZXY(yaw=0.0, roll=0.0, pitch=pitch)
     params = mobility_params_with_padding(footprint_R_body=footprint_R_body)
     cmd = RobotCommandBuilder.synchro_stand_command(params=params)
     command_client.robot_command(cmd)
@@ -313,7 +386,15 @@ def log_event(logger, event, **fields):
 
 class FollowState:
     def __init__(self):
-        self.lock_pos = None     # (x, y) in body frame of the locked person
+        # The lock is remembered in the VISION frame, not the body frame.
+        # Body-frame coordinates are only true at the instant they were
+        # measured - the body frame yaws with the robot, so a body-frame
+        # memory silently becomes a memory of a different place in the world
+        # as soon as the robot turns toward it. Every cross-frame memory
+        # below (lock_pos, last_seen_pos) is therefore vision-frame; the
+        # body-frame value is re-derived from it each frame.
+        self.lock_pos = None     # (x, y, z) in vision frame of the locked person
+        self.lock_body = None    # (x, y) of that lock in the body frame, last known
         self.locked_camera = None
         self.lost_count = 0
         self.people = []         # current frame's deduped people, sorted by bearing
@@ -321,14 +402,26 @@ class FollowState:
         self.last_idle_refresh = 0.0
         self.running = True
         self.mode = 'stand'      # 'sit' or 'stand'
+        self.pitch_up = True     # apply IDLE_LOOK_UP_PITCH to the standing pose
         self.follow_enabled = False
         self.last_loop_dt = MIN_CMD_DURATION
         self.last_full_scan = 0.0
+        self.smoothed_bearing = None   # EMA of target bearing, radians; None until a lock is live
+        self.last_vrot = 0.0           # previously commanded vrot, for rate-limiting the next one
+        self.last_seen_pos = None      # vision-frame (x, y, z) of the last *matched* target, kept past lock loss
+        self.last_seen_time = 0.0      # time.time() of that last match, for REACQUIRE_GRACE_SEC
 
 
 def nearest_index(people, pos):
+    """Index of the person closest to a vision-frame position. Matching in
+    the vision frame means the distance measured here is how far the person
+    actually moved in the world, with the robot's own rotation divided out -
+    in the body frame, a robot turning at 1 rad/s displaces a person 3 m out
+    by ~0.3 m per loop through no motion of their own, which was enough to
+    trip MAX_LOCK_JUMP and drop the lock mid-turn."""
     return min(range(len(people)),
-              key=lambda i: hypot(people[i]['x'] - pos[0], people[i]['y'] - pos[1]))
+              key=lambda i: hypot(people[i]['vision'][0] - pos[0],
+                                  people[i]['vision'][1] - pos[1]))
 
 
 def main():
@@ -373,9 +466,20 @@ def main():
     tk.Scale(conf_frame, from_=0.1, to=0.9, resolution=0.05, orient='horizontal',
             variable=confidence_var).pack(fill='x')
 
+    def idle_pitch():
+        """Body pitch for the standing/idle pose. Follow-Me is always level:
+        looking up aims the front cameras over the head of anyone close by,
+        and walking a pitched body is not what the pose is for - so while
+        Follow-Me is on this returns 0.0 no matter what the Pitch toggle
+        says. on_toggle_follow() also clears the toggle outright, making
+        this a second line of defense rather than the only one."""
+        if state.follow_enabled:
+            return 0.0
+        return IDLE_LOOK_UP_PITCH if state.pitch_up else 0.0
+
     def reset_to_idle_pose():
         state.is_idle = True
-        send_idle_pose(command_client)
+        send_stand_pose(command_client, idle_pitch())
         state.last_idle_refresh = time.time()
 
     def update_follow_button():
@@ -384,46 +488,104 @@ def main():
         else:
             follow_btn.config(text='Follow-Me: OFF', bg='#95a5a6', activebackground='#7f8c8d')
 
+    def update_stand_button():
+        """Stand is greyed out while Follow-Me runs. The robot is already
+        standing, and a blocking_stand() issued mid-follow both contends
+        with the velocity commands the loop is streaming and freezes the Tk
+        thread - and so the follow loop, and the STOP button with it - for
+        up to 10 s while it waits. Sit stays live: it is a legitimate way to
+        end a follow, and it switches Follow-Me off before it sits."""
+        stand_btn.config(state='disabled' if state.follow_enabled else 'normal')
+
+    def update_pitch_button():
+        """Pitch needs a standing robot and no active follow, so it is
+        greyed out in either other case."""
+        if state.follow_enabled:
+            pitch_btn.config(text='Pitch - off in Follow-Me', state='disabled',
+                            bg='#7f8c8d', activebackground='#7f8c8d')
+        elif state.mode == 'sit':
+            pitch_btn.config(text='Pitch - needs standing', state='disabled',
+                            bg='#7f8c8d', activebackground='#7f8c8d')
+        elif state.pitch_up:
+            pitch_btn.config(text='Pitch: LOOKING UP', state='normal',
+                            bg='#2ecc71', activebackground='#27ae60')
+        else:
+            pitch_btn.config(text='Pitch: LEVEL', state='normal',
+                            bg='#95a5a6', activebackground='#7f8c8d')
+
+    def refresh_buttons():
+        update_follow_button()
+        update_stand_button()
+        update_pitch_button()
+
     def on_sit():
         state.follow_enabled = False
-        update_follow_button()
         send_stop(command_client)
         state.mode = 'sit'
         blocking_sit(command_client, timeout_sec=10)
+        refresh_buttons()
         log_event(logger, 'mode_change', mode='sit', via='button')
 
     def on_stand():
+        # Belt and braces: the button is already disabled in this state, but
+        # a stand issued under an active follow is worth refusing twice.
+        if state.follow_enabled:
+            return
         state.mode = 'stand'
         blocking_stand(command_client, timeout_sec=10)
         reset_to_idle_pose()
-        log_event(logger, 'mode_change', mode='stand', via='button')
+        refresh_buttons()
+        log_event(logger, 'mode_change', mode='stand', via='button',
+                 pitch_up=state.pitch_up)
+
+    def on_toggle_pitch():
+        if state.follow_enabled or state.mode == 'sit':
+            return
+        state.pitch_up = not state.pitch_up
+        reset_to_idle_pose()
+        refresh_buttons()
+        log_event(logger, 'pitch_toggle', pitch_up=state.pitch_up)
 
     def on_toggle_follow():
         state.follow_enabled = not state.follow_enabled
-        if state.follow_enabled and state.mode == 'sit':
-            state.mode = 'stand'
-            blocking_stand(command_client, timeout_sec=10)
-        if not state.follow_enabled and state.mode == 'stand':
+        if state.follow_enabled:
+            # Follow-Me never looks up. The toggle is *cleared*, not merely
+            # suspended, so that stopping a follow leaves the robot level
+            # instead of pitching itself back up unprompted - re-arm it by
+            # hand afterwards if you want the searching pose back.
+            state.pitch_up = False
+            if state.mode == 'sit':
+                state.mode = 'stand'
+                blocking_stand(command_client, timeout_sec=10)
+            # Level out now rather than waiting for the loop's next idle
+            # refresh, in case the robot is standing there pitched up.
+            reset_to_idle_pose()
+        elif state.mode == 'stand':
             send_stop(command_client)
             reset_to_idle_pose()
-        update_follow_button()
-        log_event(logger, 'follow_toggle', follow_enabled=state.follow_enabled, mode=state.mode)
+        refresh_buttons()
+        log_event(logger, 'follow_toggle', follow_enabled=state.follow_enabled,
+                 mode=state.mode, pitch_up=state.pitch_up)
 
     def on_stop():
         state.follow_enabled = False
-        update_follow_button()
         send_stop(command_client)
         if state.mode == 'stand':
             reset_to_idle_pose()
+        refresh_buttons()
         log_event(logger, 'stop_button')
 
     mode_row = tk.Frame(root)
     mode_row.pack(pady=(0, 6))
-    tk.Button(mode_row, text='Sit', width=10, command=on_sit).pack(side='left', padx=6)
-    tk.Button(mode_row, text='Stand', width=10, command=on_stand).pack(side='left', padx=6)
+    tk.Button(mode_row, text='Sit', width=8, command=on_sit).pack(side='left', padx=6)
+    stand_btn = tk.Button(mode_row, text='Stand', width=8, command=on_stand)
+    stand_btn.pack(side='left', padx=6)
+    pitch_btn = tk.Button(mode_row, text='Pitch: LOOKING UP', width=20,
+                         command=on_toggle_pitch)
+    pitch_btn.pack(side='left', padx=6)
     follow_btn = tk.Button(mode_row, text='Follow-Me: OFF', width=14, command=on_toggle_follow)
     follow_btn.pack(side='left', padx=6)
-    update_follow_button()
+    refresh_buttons()
 
     def cycle_lock(direction):
         people = state.people
@@ -434,9 +596,12 @@ def main():
         else:
             idx = (nearest_index(people, state.lock_pos) + direction) % len(people)
         chosen = people[idx]
-        state.lock_pos = (chosen['x'], chosen['y'])
+        state.lock_pos = chosen['vision']
+        state.lock_body = (chosen['x'], chosen['y'])
         state.locked_camera = chosen['camera']
         state.lost_count = 0
+        state.smoothed_bearing = None
+        state.last_vrot = 0.0
 
     arrow_row = tk.Frame(root)
     arrow_row.pack(pady=(0, 12))
@@ -503,11 +668,14 @@ def main():
                                if r.source.name.endswith('_depth_in_visual_frame')}
 
             raw = []            # camera, track_id, bbox, conf, x, y (body frame)
+            raw_skipped = 0     # detections dropped for missing depth or MAX_INCIDENCE_DEG
             frames = {}         # camera -> upright color frame, for the preview windows
+            snapshot = None     # any of this frame's transform snapshots, for vision <-> body
             for name in active_cameras:
                 color_resp = by_camera[name]
                 depth_resp = depth_by_camera[name]
                 raw_frame = decode_color(color_resp)
+                snapshot = color_resp.shot.transforms_snapshot
                 raw_h, raw_w = raw_frame.shape[:2]
                 angle = upright_angle(color_resp, VISION_FRAME_NAME)
                 M, nw, nh = rotation_matrix(raw_h, raw_w, angle)
@@ -526,14 +694,24 @@ def main():
                     cx_raw, cy_raw = unrotate_point(M, cx_up, cy_up, raw_w, raw_h)
                     depth_m = sample_depth_m(depth_raw, depth_scale, cx_raw, cy_raw)
                     if depth_m is None:
+                        raw_skipped += 1
                         continue
-                    point = person_in_body_frame(color_resp, cx_raw, cy_raw, depth_m)
+                    point = person_in_frames(color_resp, cx_raw, cy_raw, depth_m)
                     if point is None:
+                        raw_skipped += 1
                         continue
-                    bx, by_, _ = point
+                    (bx, by_, _), (vx_, vy_, vz_) = point
                     raw.append({'camera': name, 'track_id': track_id,
                                'bbox': (x1, y1, x2, y2), 'conf': conf,
-                               'x': bx, 'y': by_})
+                               'x': bx, 'y': by_,
+                               'vx': vx_, 'vy': vy_, 'vz': vz_})
+
+            # Lets a vision-frame memory (the lock, the last sighting) be read
+            # back as a *live* body-frame position later in this iteration,
+            # instead of being trusted as though the robot had not moved since
+            # it was recorded.
+            body_tform_vision = (get_a_tform_b(snapshot, BODY_FRAME_NAME, VISION_FRAME_NAME)
+                                 if snapshot is not None else None)
 
             frame_people = dedupe_people(raw)
             if need_full_scan:
@@ -546,10 +724,11 @@ def main():
             target = None
             if state.lock_pos is not None and frame_people:
                 idx = nearest_index(frame_people, state.lock_pos)
-                if hypot(frame_people[idx]['x'] - state.lock_pos[0],
-                        frame_people[idx]['y'] - state.lock_pos[1]) < MAX_LOCK_JUMP:
+                if hypot(frame_people[idx]['vision'][0] - state.lock_pos[0],
+                        frame_people[idx]['vision'][1] - state.lock_pos[1]) < MAX_LOCK_JUMP:
                     target = frame_people[idx]
-                    state.lock_pos = (target['x'], target['y'])
+                    state.lock_pos = target['vision']
+                    state.lock_body = (target['x'], target['y'])
                     state.locked_camera = target['camera']
                     state.lost_count = 0
             if target is None and state.lock_pos is not None:
@@ -558,16 +737,49 @@ def main():
                     log_event(logger, 'lock_lost', last_lock_pos=state.lock_pos,
                               last_camera=state.locked_camera, lost_count=state.lost_count)
                     state.lock_pos = None
+                    state.lock_body = None
                     state.locked_camera = None
+                    state.smoothed_bearing = None
+                    state.last_vrot = 0.0
 
             if target is None and state.lock_pos is None and frame_people:
-                idx = min(range(len(frame_people)), key=lambda i: frame_people[i]['distance'])
-                target = frame_people[idx]
-                state.lock_pos = (target['x'], target['y'])
+                # A fisheye edge detection from the 'left'/'right' side
+                # cameras can place the same real person meters away from
+                # their true position (bad pinhole approximation at extreme
+                # incidence angles - see REACQUIRE_GRACE_SEC comment above).
+                # MAX_LOCK_JUMP guards a *live* lock against snapping onto
+                # that, but a fresh acquisition had no such check at all. For
+                # a short window after losing a lock, keep requiring the pick
+                # to be near where the person was actually last seen, grown
+                # by how far they could plausibly have walked since; only
+                # once that window expires (or there's no recent history) do
+                # we fall back to trusting the nearest detection outright.
+                candidates = frame_people
+                if (state.last_seen_pos is not None
+                        and loop_start - state.last_seen_time < REACQUIRE_GRACE_SEC):
+                    radius = (MAX_LOCK_JUMP
+                             + MAX_WALK_SPEED * (loop_start - state.last_seen_time))
+                    nearby = [p for p in frame_people
+                             if hypot(p['vision'][0] - state.last_seen_pos[0],
+                                      p['vision'][1] - state.last_seen_pos[1]) < radius]
+                    if nearby:
+                        candidates = nearby
+                idx = min(range(len(candidates)), key=lambda i: candidates[i]['distance'])
+                target = candidates[idx]
+                state.lock_pos = target['vision']
+                state.lock_body = (target['x'], target['y'])
                 state.locked_camera = target['camera']
                 state.lost_count = 0
+                state.smoothed_bearing = None
+                state.last_vrot = 0.0
                 log_event(logger, 'lock_acquired', track_id=target['track_id'],
-                          camera=target['camera'], distance=target['distance'])
+                          camera=target['camera'], distance=target['distance'],
+                          candidates_considered=len(candidates),
+                          candidates_total=len(frame_people))
+
+            if target is not None:
+                state.last_seen_pos = target['vision']
+                state.last_seen_time = loop_start
 
             # A missed detection on a single frame (classifier miss, brief
             # occlusion) must not drop the robot out of follow motion - that
@@ -582,29 +794,89 @@ def main():
                     distance, bearing = target['distance'], target['bearing']
                     track_desc = f'track {target["track_id"]} via {target["camera"]}'
                 else:
-                    distance = hypot(*state.lock_pos)
-                    bearing = atan2(state.lock_pos[1], state.lock_pos[0])
+                    # This frame has no detection to steer on, so the lock's
+                    # remembered position stands in - but it is re-read into
+                    # the body frame *now*, through this frame's own
+                    # transform snapshot. Taking the bearing from a stale
+                    # body-frame position instead (what this did before) held
+                    # the error constant no matter how far the robot had
+                    # already turned toward it, so every missed detection
+                    # commanded the same correction again and drove the robot
+                    # straight past the person - up to TARGET_LOST_FRAMES
+                    # times in a row, which is exactly the overshoot-and-
+                    # swing-back the smoothing below was fighting.
+                    lock_body = state.lock_body
+                    if body_tform_vision is not None:
+                        px, py, _ = body_tform_vision.transform_point(*state.lock_pos)
+                        lock_body = (px, py)
+                    if lock_body is None:
+                        # Neither a snapshot nor a prior body-frame reading:
+                        # nothing to steer on. (FOLLOW_DISTANCE, 0) lands
+                        # inside both deadbands, so this frame commands a
+                        # hold instead of a guess.
+                        lock_body = (FOLLOW_DISTANCE, 0.0)
+                    state.lock_body = lock_body
+                    distance = hypot(*lock_body)
+                    bearing = atan2(lock_body[1], lock_body[0])
                     track_desc = (f'last known position (miss {state.lost_count}/'
                                   f'{TARGET_LOST_FRAMES})')
+
+                # Raw per-frame bearing is noisy and turning straight to a
+                # plain P-controller's output overshoots the person and
+                # swings back - the left/right flicker when standing roughly
+                # dead ahead. Smooth the bearing with an EMA, ignore what's
+                # left inside ANGULAR_DEADBAND, and rate-limit how fast the
+                # commanded vrot itself can swing so a correction ramps
+                # instead of snapping.
+                if state.smoothed_bearing is None:
+                    state.smoothed_bearing = bearing
+                else:
+                    state.smoothed_bearing += BEARING_SMOOTHING_ALPHA * (
+                        bearing - state.smoothed_bearing)
+
                 error = distance - FOLLOW_DISTANCE
                 vx = 0.0 if abs(error) < DISTANCE_DEADBAND else clamp(
                     KP_LINEAR * error, -MAX_LINEAR_VEL, MAX_LINEAR_VEL)
+                # vx drives along the body's *current* x axis, which is only
+                # the direction of the person once the turn has caught up.
+                # Driving at full speed while still well off-bearing carves
+                # an arc around them - the robot orbits at roughly constant
+                # distance and the bearing error is fed as fast as it is
+                # corrected, which is the other half of never quite
+                # centering. Fading the forward component out with the
+                # bearing (nothing left to fade by ~90 deg) makes it turn
+                # first and close the gap once it is roughly aligned.
+                # Backing off is deliberately exempt: if someone crowds the
+                # robot from the side, it should still give ground.
+                if vx > 0.0:
+                    vx *= max(0.0, cos(state.smoothed_bearing))
                 if distance < MIN_SAFE_DISTANCE:
                     vx = min(vx, 0.0)
-                vrot = clamp(KP_ANGULAR * bearing, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
+
+                vrot_target = 0.0 if abs(state.smoothed_bearing) < ANGULAR_DEADBAND else clamp(
+                    KP_ANGULAR * state.smoothed_bearing, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
+                max_dvrot = MAX_ANGULAR_ACCEL * max(state.last_loop_dt, 0.01)
+                vrot = clamp(vrot_target, state.last_vrot - max_dvrot, state.last_vrot + max_dvrot)
+                state.last_vrot = vrot
+
                 cmd_duration = clamp(state.last_loop_dt * 2.0, MIN_CMD_DURATION, MAX_CMD_DURATION)
                 send_velocity(command_client, vx, 0.0, vrot, cmd_duration)
                 state.is_idle = False
                 lock_text = (f'Locked: {track_desc}\n'
-                            f'distance {distance:.2f} m   bearing {bearing:+.2f} rad')
+                            f'distance {distance:.2f} m   bearing {bearing:+.2f} rad'
+                            f' (smoothed {state.smoothed_bearing:+.2f}, cmd {vrot:+.2f})')
             else:
+                # idle_pitch() is what keeps the searching pose level while
+                # Follow-Me is on - this branch is exactly the "following,
+                # but nobody in view" case that used to look up.
                 if not state.is_idle:
-                    send_idle_pose(command_client)
+                    send_stand_pose(command_client, idle_pitch())
                     state.last_idle_refresh = time.time()
                     state.is_idle = True
-                    log_event(logger, 'idle_enter', follow_enabled=state.follow_enabled)
+                    log_event(logger, 'idle_enter', follow_enabled=state.follow_enabled,
+                              pitch=round(idle_pitch(), 3))
                 elif time.time() - state.last_idle_refresh > IDLE_REFRESH_SEC:
-                    send_idle_pose(command_client)
+                    send_stand_pose(command_client, idle_pitch())
                     state.last_idle_refresh = time.time()
                 if not state.follow_enabled:
                     lock_text = (f'Follow-Me OFF - selected track {target["track_id"]} via '
@@ -617,12 +889,17 @@ def main():
 
             log_event(logger, 'tick', mode=state.mode, follow_enabled=state.follow_enabled,
                       is_idle=state.is_idle, people_count=len(people),
-                      lock_pos=state.lock_pos, locked_camera=state.locked_camera,
+                      lock_pos=state.lock_pos, lock_body=state.lock_body,
+                      locked_camera=state.locked_camera,
                       lost_count=state.lost_count,
+                      smoothed_bearing=(round(state.smoothed_bearing, 3)
+                                        if state.smoothed_bearing is not None else None),
+                      last_vrot=round(state.last_vrot, 3),
                       target=({'track_id': target['track_id'], 'camera': target['camera'],
                                'distance': round(target['distance'], 3),
                                'bearing': round(target['bearing'], 3)}
                               if target is not None else None),
+                      raw_skipped=raw_skipped,
                       detections=[{'camera': d['camera'], 'track_id': d['track_id'],
                                    'conf': round(d['conf'], 3),
                                    'distance': round(hypot(d['x'], d['y']), 3)} for d in raw])
@@ -671,10 +948,11 @@ def main():
         if already_standing:
             state.mode = 'stand'
             blocking_stand(command_client, timeout_sec=10)
-            send_idle_pose(command_client)
+            send_stand_pose(command_client, idle_pitch())
             state.last_idle_refresh = time.time()
         else:
             state.mode = 'sit'
+        refresh_buttons()
 
         root.after(LOOP_DELAY_MS, step)
         try:
