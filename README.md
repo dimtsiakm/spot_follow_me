@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/santanna_logo.png" alt="Scuola Superiore Sant'Anna, Pisa" width="400">
+</p>
+
 # Spot: follow-me
 
 A person-following demo for the Boston Dynamics **Spot** robot. It uses only
@@ -266,6 +270,8 @@ This software moves a heavy legged robot near people. Before using it:
 │   ├── basic_commands.py   # sit/stand menu (connection check)
 │   ├── grab_frame.py       # one-shot capture + detection (camera check)
 │   └── follow_me.py        # follow-me demo
+├── assets/
+│   └── santanna_logo.png   # logo used in this README
 ├── requirements.txt
 ├── LICENSE
 └── README.md
