@@ -9,7 +9,10 @@ distance (1.5 m by default) from the person it is locked onto. A small control
 window lets the operator see how many people are in view, switch the lock to
 another person, sit or stand the robot, and stop it at any time.
 
+**Video demo:** [watch on YouTube](https://www.youtube.com/watch?v=pd_SZVHmwis)
+
 **Author:** Dimitrios Tsiakmakis, MSc AI, PhD Candidate, Scuola Superiore Sant'Anna, Pisa
+([website](https://dimtsiakm.github.io/) · [LinkedIn](https://www.linkedin.com/in/dimitris-tsiakmakis/))
 
 ---
 
