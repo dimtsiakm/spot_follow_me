@@ -3,3 +3,5 @@
 /spot_frame.jpg
 /yolo11n.pt
 /logs
+__pycache__/
+*.pyc

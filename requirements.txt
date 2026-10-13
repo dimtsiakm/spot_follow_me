@@ -1,0 +1,15 @@
+# Boston Dynamics Spot SDK
+bosdyn-client>=4.0.0
+bosdyn-api>=4.0.0
+bosdyn-core>=4.0.0
+
+# Perception (YOLO11 + ByteTrack)
+ultralytics>=8.3.0
+lap>=0.5.12
+
+# Image handling
+opencv-python>=4.8
+numpy>=1.24,<2
+
+# PyTorch is pulled in by ultralytics, but pip installs the CPU-only build by
+# default. For GPU inference, install the CUDA build first - see README.md.
